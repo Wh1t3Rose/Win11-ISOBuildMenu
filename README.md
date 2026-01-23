@@ -1,4 +1,4 @@
-.CHANGELOG
+## Changelog
     v1.0.0 - Initial release 2026-01-15
         - Base ISO extraction and rebuild logic
         - Driver injection support
