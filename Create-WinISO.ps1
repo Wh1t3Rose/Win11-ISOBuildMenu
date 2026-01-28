@@ -78,6 +78,17 @@ Module: Create-WinISO
         - If DL-WinISO fails, prompt user to provide an ISO (support Media Creation Tool flow)
         - Download Microsoft Media Creation Tool, wait 3s before download, and launch it elevated
         - Various robustness and UX improvements around downloads and prompts
+    v2.3.1 - 2026-01-28
+        - Automatic import of drivers from `C:\Drivers` tree
+        - New `Import-DriversFromDriversRoot` helper enumerates `C:\Drivers\{Manufacturer}\{Model}\{DriverType}` and copies selected types into the build `Drivers` folder
+        - `Select-Drivers` now prompts to auto-import from `C:\Drivers` before manual manufacturer/type selection
+        - Non-interactive mode will auto-import defaults (Wifi/Wireless, Ethernet, Chipset)
+        - DISM driver injection is conditional and will skip if no drivers are present
+    v2.3.2 - 2026-01-28
+        - Added `Should-PerformCleanBuild` helper to prompt when `StockISO` contains an ISO and `WindowsISO` is non-empty
+        - Automatic and Build flows now ask to perform a clean build; if declined, existing build folders are preserved
+        - Integrated clean-build prompt into Automatic and Build menu options
+        - Small fixes: removed stray token and corrected `oscdimg` boot-argument quoting
 #>
 
 Param(
@@ -107,7 +118,8 @@ if ($Help) {
 }
 
 # ---------------- Script Version Auto-Increment ----------------
-$ScriptVersion = [version]2.2.0
+# Base script version (will auto-increment the build number)
+$ScriptVersion = [version]2.3.1
 $NewVersion    = [version]::new($ScriptVersion.Major, $ScriptVersion.Minor, $ScriptVersion.Build + 1)
 Write-Host "Running script version $NewVersion"
 
@@ -360,6 +372,29 @@ function Ensure-Oscdimg {
 
 # ---------------- Functions ----------------
 
+# Determine whether to perform a clean build (empty build folders except Drivers).
+function Should-PerformCleanBuild {
+    param(
+        [string]$StockISOPath,
+        [string]$TempISOPath,
+        [switch]$NonInteractive
+    )
+
+    $isoFound = Get-ChildItem -Path $StockISOPath -Filter *.iso -ErrorAction SilentlyContinue | Select-Object -First 1
+    $tempHasFiles = $false
+    try { $tempHasFiles = (Get-ChildItem -Path $TempISOPath -Recurse -Force -ErrorAction SilentlyContinue | Where-Object { -not ($_.PSIsContainer -and $_.Name -eq '.') }).Count -gt 0 } catch { $tempHasFiles = $false }
+
+    if ($isoFound -and $tempHasFiles) {
+        if ($NonInteractive) { return $true }
+        Write-Host "A previous ISO exists in $StockISOPath and $TempISOPath is not empty."
+        do { $ans = Read-Host 'Perform a Clean Build (this will delete build folders except Drivers)? (Y/N)' } while ($ans -notin 'Y','y','N','n')
+        return ($ans -in 'Y','y')
+    }
+
+    # Default behaviour: perform clean build
+    return $true
+}
+
 # Hard cleanup of Build root, preserve Drivers folder
 function Cleanup-BuildRootPreserveDrivers {
     param (
@@ -605,24 +640,24 @@ function Show-Menu {
     Write-Host ""
     Write-Host '  ############################################################'
     Write-Host '  #                                                          #'
-    Write-Host '  #               WINDOWS ISO BUILDER - Create-WinISO        #'
-    Write-Host '  #         Extract • Inject Drivers • Rebuild (BIOS+UEFI)   #'
-    Write-Host '  #                                                          #'
-    Write-Host '  #        Tip: Run as Administrator for full capabilities   #'
+    Write-Host '  #           WINDOWS ISO BUILDER - Create-WinISO            #'
+    Write-Host '  #           Extract • Inject Drivers • Rebuild             #'
+    Write-Host '  #     https://github.com/Wh1t3Rose/Win11-ISOBuildMenu      #'
     Write-Host '  #                                                          #'
     Write-Host '  ############################################################'
     Write-Host ""
     Write-Host "  1) Automatic (Full Build)     - Run the full build flow"
     Write-Host "  2) Download ISO               - Use DL-WinISO / MCT fallback"
     Write-Host "  3) Select Drivers             - Add or copy driver folders"
-    Write-Host "  4) Build ISO                  - Extract, inject, and rebuild"
-    Write-Host "  5) Exit                       - Quit the script"
+    Write-Host "  4) Full Build                 - Use provided ISO, Extract, Inject drivers, Rebuild ISO"
+    Write-Host "  5) Build ISO Only             - Use existing extracted WindowsISO folder to create bootable ISO"
+    Write-Host "  6) Exit                       - Quit the script"
     Write-Host ""
 
     # Decorative footer
     Write-Host '  ------------------------------------------------------------'
 
-    do { $menuChoice = Read-Host 'Select an option (1-5)' } while ($menuChoice -notin '1','2','3','4','5')
+    do { $menuChoice = Read-Host 'Select an option (1-6)' } while ($menuChoice -notin '1','2','3','4','5','6')
     return $menuChoice
 }
 
@@ -630,6 +665,26 @@ function Select-Drivers {
     $moreDrivers = $true
     $Manufacturers = @("Dell","Lenovo","Other")
     $Categories    = @("Wifi","Ethernet","Chipset","Storage","Video")
+
+    # If a standard C:\Drivers tree exists, ask user whether to auto-import before manual selection
+    if (Test-Path 'C:\Drivers') {
+        if ($NonInteractive) {
+                Import-DriversFromDriversRoot -SourceRoot 'C:\Drivers' -DestRoot $Drivers -DefaultTypes @('Wifi','Wireless','Ethernet','Chipset')
+            return
+        }
+
+        Write-Host "Detected driver repository at C:\Drivers"
+        Write-Host "Options: (A)uto-import detected types  (M)anual selection  (S)kip"
+        do { $choice = Read-Host 'Choose A, M or S' } while ($choice -notin 'A','M','S','a','m','s')
+        switch ($choice.ToUpper()) {
+                'A' {
+                    Import-DriversFromDriversRoot -SourceRoot 'C:\Drivers' -DestRoot $Drivers -DefaultTypes @('Wifi','Wireless','Ethernet')
+                    return
+                }
+            'S' { Write-Host 'Skipping import from C:\Drivers'; return }
+            default { Write-Host 'Proceeding to manual selection...' }
+        }
+    }
 
     while ($moreDrivers) {
         Write-Host "`nSelect manufacturer:"
@@ -670,13 +725,106 @@ function Select-Drivers {
     }
 }
 
+# Import drivers from a standard C:\Drivers structure: C:\Drivers\{Manufacturer}\{Model}\{DriverType}
+function Import-DriversFromDriversRoot {
+    param(
+        [string]$SourceRoot = 'C:\Drivers',
+        [string]$DestRoot = $Drivers,
+        [string[]]$DefaultTypes = @('Wifi','Wireless','Ethernet')
+    )
+
+    if (-not (Test-Path $SourceRoot)) { return }
+
+    Write-Host "Detected drivers root at $SourceRoot"
+
+    # Build a map of found items: Manufacturer -> Model -> Types
+    $found = @()
+    Get-ChildItem -Path $SourceRoot -Directory -ErrorAction SilentlyContinue | ForEach-Object {
+        $manu = $_.Name
+        Get-ChildItem -Path $_.FullName -Directory -ErrorAction SilentlyContinue | ForEach-Object {
+            $model = $_.Name
+            $types = Get-ChildItem -Path $_.FullName -Directory -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Name
+            if ($types) { $found += [pscustomobject]@{ Manufacturer = $manu; Model = $model; Types = $types } }
+        }
+    }
+
+    if (-not $found) { Write-Host "No manufacturer/model driver folders found under $SourceRoot"; return }
+
+    # Decide default action
+    if ($NonInteractive) {
+        $action = 'A' # Auto-import defaults in non-interactive
+    } else {
+        Write-Host "Driver folders detected under $SourceRoot."
+        Write-Host "Options: (A)uto-import default types ($([string]::Join(',',($DefaultTypes -split ','))))  (S)elect per model  (N)one"
+        do { $action = Read-Host 'Choose A,S or N' } while ($action -notin 'A','S','N','a','s','n')
+        $action = $action.ToUpper()
+    }
+
+    if ($action -eq 'N') { Write-Host 'Skipping automatic import from C:\Drivers'; return }
+
+    if (-not (Test-Path $DestRoot)) { New-Item -ItemType Directory -Path $DestRoot -Force | Out-Null }
+
+    foreach ($entry in $found) {
+        $manu = $entry.Manufacturer
+        $model = $entry.Model
+        $availableTypes = $entry.Types
+
+        if ($action -eq 'A') {
+            # select matching default types (case-insensitive, treat Wireless ~ Wifi)
+            $selected = @()
+            foreach ($t in $availableTypes) {
+                foreach ($d in $DefaultTypes) {
+                    if ($t.ToLower() -eq $d.ToLower() -or ($t.ToLower() -eq 'wireless' -and $d.ToLower() -eq 'wifi')) { $selected += $t; break }
+                }
+            }
+        } else {
+            # Interactive per-model selection
+            Write-Host "\nManufacturer: $manu  Model: $model"
+            for ($i=0; $i -lt $availableTypes.Count; $i++) { Write-Host " $($i+1)) $($availableTypes[$i])" }
+            Write-Host " 0) Skip this model"
+            $selections = @()
+            do {
+                $sel = Read-Host 'Enter numbers to import (comma separated) or 0 to skip'
+                if ($sel -match '^[0-9,\s]+$') {
+                    $nums = ($sel -split ',') | ForEach-Object { $_.Trim() } | Where-Object { $_ -ne '' }
+                    if ($nums -contains '0') { break }
+                    foreach ($n in $nums) {
+                        if ([int]$n -ge 1 -and [int]$n -le $availableTypes.Count) { $selections += $availableTypes[[int]$n - 1] }
+                    }
+                }
+            } while (-not $selections)
+            $selected = $selections
+        }
+
+        if (-not $selected -or $selected.Count -eq 0) { continue }
+
+        foreach ($type in $selected | Sort-Object -Unique) {
+            $src = Join-Path -Path (Join-Path -Path $SourceRoot -ChildPath $manu) -ChildPath (Join-Path -Path $model -ChildPath $type)
+            if (-not (Test-Path $src)) { $src = Join-Path -Path (Join-Path $SourceRoot $manu) -ChildPath (Join-Path $model ($type)) }
+            if (-not (Test-Path $src)) { Write-Warning "Source not found for $manu\$model\$type"; continue }
+
+            $dest = Join-Path -Path $DestRoot -ChildPath (Join-Path $manu (Join-Path $model $type))
+            if (-not (Test-Path $dest)) { New-Item -ItemType Directory -Path $dest -Force | Out-Null }
+            Write-Host "Copying drivers: $src -> $dest"
+            try { Copy-Item -Path (Join-Path $src '*') -Destination $dest -Recurse -Force -ErrorAction Stop } catch { Write-Warning "Failed to copy $src : $_" }
+        }
+    }
+
+    Write-Host "Automatic import from $SourceRoot complete. Drivers available at $DestRoot"
+}
+
 # ---------------- Menu Execution ----------------
+$BuildOnly = $false
 $MenuOption = Show-Menu
 switch ($MenuOption) {
     "1" {
         Write-Host "`n=== AUTOMATIC MODE ==="
-        # Hard cleanup of Build root
-        Cleanup-BuildRootPreserveDrivers -BuildRoot $BuildRoot
+        # Hard cleanup of Build root (ask if StockISO exists and WindowsISO isn't empty)
+        if (Should-PerformCleanBuild -StockISOPath $StockISO -TempISOPath $TempISO -NonInteractive:$NonInteractive) {
+            Cleanup-BuildRootPreserveDrivers -BuildRoot $BuildRoot
+        } else {
+            Write-Host "Skipping clean build; preserving existing build folders." -ForegroundColor Yellow
+        }
 
         # Ensure necessary folders exist
         $RequiredFolders = @($TempISO, $WimMount, $CustomISO, $StockISO)
@@ -728,7 +876,11 @@ switch ($MenuOption) {
     }
     "4" {
         Write-Host "`n=== BUILD ISO ==="
-        Cleanup-BuildRootPreserveDrivers -BuildRoot $BuildRoot
+        if (Should-PerformCleanBuild -StockISOPath $StockISO -TempISOPath $TempISO -NonInteractive:$NonInteractive) {
+            Cleanup-BuildRootPreserveDrivers -BuildRoot $BuildRoot
+        } else {
+            Write-Host "Skipping clean build; preserving existing build folders." -ForegroundColor Yellow
+        }
         $RequiredFolders = @($TempISO, $WimMount, $CustomISO, $StockISO)
         $createdFolders = @()
         foreach ($folder in $RequiredFolders) {
@@ -746,36 +898,53 @@ switch ($MenuOption) {
         $ISOSource       = $ISOInfo.Source
     }
     "5" {
+        Write-Host "\n=== BUILD ONLY: Create bootable ISO from existing files ==="
+        $BuildOnly = $true
+        # Ensure required folders exist for building
+        $RequiredFolders = @($TempISO, $CustomISO)
+        foreach ($folder in $RequiredFolders) { if (-not (Test-Path $folder)) { New-Item -ItemType Directory -Path $folder -Force | Out-Null } }
+        # Ensure oscdimg/ADK is available
+        $Oscdimg = Ensure-Oscdimg -PreferredPath $Oscdimg -NonInteractive:$NonInteractive
+    }
+    "6" {
         Write-Host "Exiting..."
         exit 0
     }
 }
 
 # ---------------- Copy ISO to StockISO ----------------
-$ExistingISO = Get-ChildItem -Path $StockISO -Filter *.iso -ErrorAction SilentlyContinue | Select-Object -First 1
-if (-not $ExistingISO -or $ExistingISO.FullName -ne $WindowsISOPath) {
-    Write-Host "=================== COPYING ISO TO STOCKISO ==================="
-    Copy-Item $WindowsISOPath -Destination $StockISO -Force
+if (-not $BuildOnly) {
+    $ExistingISO = Get-ChildItem -Path $StockISO -Filter *.iso -ErrorAction SilentlyContinue | Select-Object -First 1
+    if (-not $ExistingISO -or $ExistingISO.FullName -ne $WindowsISOPath) {
+        Write-Host "=================== COPYING ISO TO STOCKISO ==================="
+        Copy-Item $WindowsISOPath -Destination $StockISO -Force
+    } else {
+        Write-Host "ISO already exists in StockISO. Skipping copy."
+    }
 } else {
-    Write-Host "ISO already exists in StockISO. Skipping copy."
+    Write-Host "Build-only selected: skipping ISO copy to StockISO." -ForegroundColor Yellow
 }
 
 # ---------------- Extract ISO ----------------
 $IsoFile = Get-ChildItem -Path $StockISO -Filter *.iso | Select-Object -First 1
 $TempExtractMarker = Join-Path $TempISO ".extracted"
 
-if (Test-Path $TempExtractMarker) {
-    Write-Host "ISO already extracted. Skipping extraction."
-} else {
-    Write-Host "=================== EXTRACTING ISO ==================="
-    $DiskImage = Mount-DiskImage -ImagePath $IsoFile.FullName -PassThru
-    $Volume    = $DiskImage | Get-Volume
-    if (-not $Volume.DriveLetter) { Dismount-DiskImage -ImagePath $IsoFile.FullName; throw "Failed to determine ISO drive letter" }
+if (-not $BuildOnly) {
+    if (Test-Path $TempExtractMarker) {
+        Write-Host "ISO already extracted. Skipping extraction."
+    } else {
+        Write-Host "=================== EXTRACTING ISO ==================="
+        $DiskImage = Mount-DiskImage -ImagePath $IsoFile.FullName -PassThru
+        $Volume    = $DiskImage | Get-Volume
+        if (-not $Volume.DriveLetter) { Dismount-DiskImage -ImagePath $IsoFile.FullName; throw "Failed to determine ISO drive letter" }
 
-    $IsoDrive = "$($Volume.DriveLetter):\"
-    Copy-Item -Path "$IsoDrive*" -Destination $TempISO -Recurse -Force
-    Dismount-DiskImage -ImagePath $IsoFile.FullName
-    New-Item -Path $TempExtractMarker -ItemType File | Out-Null
+        $IsoDrive = "$($Volume.DriveLetter):\"
+        Copy-Item -Path "$IsoDrive*" -Destination $TempISO -Recurse -Force
+        Dismount-DiskImage -ImagePath $IsoFile.FullName
+        New-Item -Path $TempExtractMarker -ItemType File | Out-Null
+    }
+} else {
+    Write-Host "Build-only selected: skipping ISO extraction." -ForegroundColor Yellow
 }
 
 Write-Host "`n=================== BUILDING WINDOWS ISO ==================="
@@ -818,8 +987,109 @@ if ($Mounted) {
 dism.exe /Mount-Wim /WimFile:$WorkingWIM /Index:1 /MountDir:$WimMount
 
 # ---------------- Add Drivers ----------------
+# If a C:\Drivers tree exists, offer to import drivers automatically (or select specific types)
+    if (Test-Path 'C:\Drivers') {
+    Import-DriversFromDriversRoot -SourceRoot 'C:\Drivers' -DestRoot $Drivers -DefaultTypes @('Wifi','Wireless','Ethernet')
+}
 Write-Host "Injecting drivers from $Drivers..."
-dism.exe /Image:$WimMount /Add-Driver /Driver:$Drivers /Recurse
+if (-not (Test-Path $Drivers)) {
+    Write-Warning "Drivers folder $Drivers does not exist. Skipping driver injection." 
+} else {
+    # Validate mount and drivers path
+    Write-Host "Starting DISM driver injection..." -ForegroundColor Cyan
+    Write-Host "MountDir: $WimMount" -ForegroundColor DarkGray
+    Write-Host "Drivers:  $Drivers" -ForegroundColor DarkGray
+    if (-not (Test-Path $WimMount)) { Write-Error "WIM mount directory not found: $WimMount"; throw "WIM mount not available" }
+    if (-not (Test-Path $Drivers))  { Write-Warning "Drivers folder $Drivers does not exist. Skipping driver injection."; goto SkipDriverInjection }
+
+    $dismArgString = "/Image:`"$WimMount`" /Add-Driver /Driver:`"$Drivers`" /Recurse"
+    $psi = New-Object System.Diagnostics.ProcessStartInfo
+    $psi.FileName = 'dism.exe'
+    $psi.Arguments = $dismArgString
+    $psi.UseShellExecute = $false
+    $psi.RedirectStandardOutput = $true
+    $psi.RedirectStandardError = $true
+    $proc = New-Object System.Diagnostics.Process
+    $proc.StartInfo = $psi
+    Write-Host "Running: $($psi.FileName) $($psi.Arguments)" -ForegroundColor DarkGray
+    $proc.Start() | Out-Null
+    while (-not $proc.HasExited) {
+        try {
+            while (-not $proc.StandardOutput.EndOfStream) {
+                $line = $proc.StandardOutput.ReadLine()
+                if ($line -match '^Installing\s+(\d+)\s+of\s+(\d+)\s+-\s+(.+?):\s*(.+)$') {
+                    $i = $matches[1]; $total = $matches[2]; $file = $matches[3]; $msg = $matches[4]
+                    $msgLower = $msg.ToLower()
+                    if ($msgLower -match 'successfully') { $col = 'Green' }
+                    elseif ($msgLower -match 'already') { $col = 'Yellow' }
+                    elseif ($msgLower -match 'warning') { $col = 'Yellow' }
+                    else { $col = 'Red' }
+                    Write-Host "Installing $i of $total - ${file}: $msg" -ForegroundColor $col
+                } elseif ($line -match '^Error|^error|failed|cannot|not found' -or $line -match 'error code') {
+                    Write-Host $line -ForegroundColor Red
+                } else { Write-Host $line -ForegroundColor DarkGray }
+            }
+            while (-not $proc.StandardError.EndOfStream) { Write-Host $proc.StandardError.ReadLine() -ForegroundColor Red }
+        } catch { }
+        Start-Sleep -Milliseconds 100
+    }
+    # Drain remaining output
+    try { while (-not $proc.StandardOutput.EndOfStream) { Write-Host $proc.StandardOutput.ReadLine() -ForegroundColor DarkGray } } catch {}
+    try { while (-not $proc.StandardError.EndOfStream)  { Write-Host $proc.StandardError.ReadLine()  -ForegroundColor Red } } catch {}
+    if ($proc.ExitCode -ne 0) { Write-Error "DISM returned exit code $($proc.ExitCode)"; throw "DISM add-driver failed" }
+ :SkipDriverInjection
+}
+
+# If a drivers repository exists and we're interactive, offer to import/inject other types
+if ((Test-Path 'C:\Drivers') -and -not $NonInteractive) {
+    Write-Host "`nDefault import injected Ethernet and Wireless/Wifi drivers from C:\Drivers."
+    $ans = Read-Host 'Do you want to import and inject other driver types from C:\Drivers now? (Y/N)'
+    if ($ans -in 'Y','y') {
+        # Run interactive import to let user choose other types/manufacturers
+        Import-DriversFromDriversRoot -SourceRoot 'C:\Drivers' -DestRoot $Drivers
+
+        Write-Host "Injecting additional drivers from $Drivers..." -ForegroundColor Cyan
+        if (-not (Test-Path $WimMount)) { Write-Error "WIM mount directory not found: $WimMount"; throw "WIM mount not available" }
+        if (-not (Test-Path $Drivers))  { Write-Warning "Drivers folder $Drivers does not exist. Skipping driver injection."; goto SkipDriverInjection }
+
+        $dismArgString2 = "/Image:`"$WimMount`" /Add-Driver /Driver:`"$Drivers`" /Recurse"
+        $psi2 = New-Object System.Diagnostics.ProcessStartInfo
+        $psi2.FileName = 'dism.exe'
+        $psi2.Arguments = $dismArgString2
+        $psi2.UseShellExecute = $false
+        $psi2.RedirectStandardOutput = $true
+        $psi2.RedirectStandardError = $true
+        $proc2 = New-Object System.Diagnostics.Process
+        $proc2.StartInfo = $psi2
+        Write-Host "Running: $($psi2.FileName) $($psi2.Arguments)" -ForegroundColor DarkGray
+        $proc2.Start() | Out-Null
+        while (-not $proc2.HasExited) {
+            try {
+                while (-not $proc2.StandardOutput.EndOfStream) {
+                    $line = $proc2.StandardOutput.ReadLine()
+                    if ($line -match '^Installing\s+(\d+)\s+of\s+(\d+)\s+-\s+(.+?):\s*(.+)$') {
+                        $i = $matches[1]; $total = $matches[2]; $file = $matches[3]; $msg = $matches[4]
+                        $msgLower = $msg.ToLower()
+                        if ($msgLower -match 'successfully') { $col = 'Green' }
+                        elseif ($msgLower -match 'already') { $col = 'Yellow' }
+                        elseif ($msgLower -match 'warning') { $col = 'Yellow' }
+                        else { $col = 'Red' }
+                        Write-Host "Installing $i of $total - ${file}: $msg" -ForegroundColor $col
+                    } elseif ($line -match '^Error|^error|failed|cannot|not found' -or $line -match 'error code') {
+                        Write-Host $line -ForegroundColor Red
+                    } else { Write-Host $line -ForegroundColor DarkGray }
+                }
+                while (-not $proc2.StandardError.EndOfStream) { Write-Host $proc2.StandardError.ReadLine() -ForegroundColor Red }
+            } catch { }
+            Start-Sleep -Milliseconds 100
+        }
+        try { while (-not $proc2.StandardOutput.EndOfStream) { Write-Host $proc2.StandardOutput.ReadLine() -ForegroundColor DarkGray } } catch {}
+        try { while (-not $proc2.StandardError.EndOfStream)  { Write-Host $proc2.StandardError.ReadLine()  -ForegroundColor Red } } catch {}
+        if ($proc2.ExitCode -ne 0) { Write-Error "DISM returned exit code $($proc2.ExitCode)"; throw "DISM add-driver failed" }
+    } else {
+        Write-Host "Skipping additional driver imports." -ForegroundColor Yellow
+    }
+}
 
 # ---------------- Commit WIM ----------------
 Write-Host "Committing WIM changes..."
@@ -834,27 +1104,78 @@ dism.exe /Export-Image `
     /DestinationImageFile:$InstallESD `
     /Compress:Recovery
 
-Remove-Item $WorkingWIM -Force
+# After converting back to ESD, move the intermediate WIM out of the $TempISO folder
+# to avoid including the large WIM in the rebuilt ISO while still preserving it for debugging.
+if (Test-Path $InstallESD -and Test-Path $WorkingWIM) {
+    $WimBackupDir = Join-Path $BuildRoot 'WorkingWIMs'
+    if (-not (Test-Path $WimBackupDir)) { New-Item -ItemType Directory -Path $WimBackupDir -Force | Out-Null }
+    $timestamp = Get-Date -Format yyyyMMddHHmmss
+    $WimBackupPath = Join-Path $WimBackupDir "install.wim.$timestamp.bak"
+    try {
+        Move-Item -Path $WorkingWIM -Destination $WimBackupPath -Force -ErrorAction Stop
+        Write-Host "Moved intermediate WIM out of build folder to: $WimBackupPath" -ForegroundColor DarkGray
+        $PreservedWorkingWIM = $WimBackupPath
+    } catch {
+        Write-Warning "Failed to move $WorkingWIM out of build folder: $($_)"; $PreservedWorkingWIM = $WorkingWIM
+    }
+} else {
+    $PreservedWorkingWIM = $WorkingWIM
+}
 
-$# ---------------- Build Bootable ISO ----------------
-
-# Ensure oscdimg.exe is available; prompt user to install ADK if missing
 # ---------------- Build Bootable ISO ----------------
+# Ensure oscdimg.exe is available; prompt user to install ADK if missing
 # Boot file paths
 $BootBIOS = Join-Path $TempISO "boot\etfsboot.com"
 $BootUEFI = Join-Path $TempISO "efi\microsoft\boot\efisys.bin"
-if (-not (Test-Path $BootBIOS)) { throw "Missing BIOS boot file" }
-if (-not (Test-Path $BootUEFI)) { throw "Missing UEFI boot file" }
+if (-not (Test-Path $BootBIOS)) { throw "Missing BIOS boot file: $BootBIOS" }
+if (-not (Test-Path $BootUEFI)) { throw "Missing UEFI boot file: $BootUEFI" }
 
 Write-Host "Creating bootable ISO at $ISOOut..."
-& $Oscdimg `
-    -m `
-    -o `
-    -u2 `
-    -udfver102 `
-    -bootdata:2#p0,e,b"$BootBIOS"#pEF,e,b"$BootUEFI" `
-    $TempISO `
-    $ISOOut
 
-Write-Host "=== SUCCESS ==="
-Write-Host "Windows Pro ISO created at: $ISOOut"
+# Build the bootdata argument carefully so paths are quoted correctly for oscdimg
+$bootDataArg = "-bootdata:2#p0,e,b`"$BootBIOS`"#pEF,e,b`"$BootUEFI`" `"$TempISO`" `"$ISOOut`""
+
+# Use ProcessStartInfo to pass a single argument string to oscdimg (avoids extra quoting issues)
+$psi = New-Object System.Diagnostics.ProcessStartInfo
+$psi.FileName = $Oscdimg
+$psi.Arguments = "-m -o -u2 -udfver102 $bootDataArg"
+$psi.UseShellExecute = $false
+$psi.RedirectStandardOutput = $true
+$psi.RedirectStandardError = $true
+$proc = New-Object System.Diagnostics.Process
+$proc.StartInfo = $psi
+
+Write-Host "Running: $($psi.FileName) $($psi.Arguments)" -ForegroundColor DarkGray
+$proc.Start() | Out-Null
+
+# Stream output while process runs
+while (-not $proc.HasExited) {
+    try {
+        while (-not $proc.StandardOutput.EndOfStream) {
+            Write-Host $proc.StandardOutput.ReadLine() -ForegroundColor DarkGray
+        }
+        while (-not $proc.StandardError.EndOfStream) {
+            Write-Host $proc.StandardError.ReadLine() -ForegroundColor Red
+        }
+    } catch { }
+    Start-Sleep -Milliseconds 100
+}
+
+# Read remaining output
+try { while (-not $proc.StandardOutput.EndOfStream) { Write-Host $proc.StandardOutput.ReadLine() -ForegroundColor DarkGray } } catch {}
+try { while (-not $proc.StandardError.EndOfStream)  { Write-Host $proc.StandardError.ReadLine()  -ForegroundColor Red } } catch {}
+
+$exitCode = $proc.ExitCode
+if ($exitCode -ne 0) {
+    Write-Error "oscdimg failed with exit code $exitCode. ISO not created."
+    exit $exitCode
+} else {
+    Write-Host "=== SUCCESS ==="
+    Write-Host "Windows Pro ISO created at: $ISOOut"
+    # ISO created successfully — remove the preserved intermediate WIM backup (if any)
+    if ($PreservedWorkingWIM) {
+        if (Test-Path $PreservedWorkingWIM) {
+            try { Remove-Item $PreservedWorkingWIM -Force -ErrorAction Stop; Write-Host "Removed preserved intermediate WIM: ${PreservedWorkingWIM}" -ForegroundColor DarkGray } catch { Write-Warning "Failed to remove ${PreservedWorkingWIM}: $($_)" }
+        }
+    }
+}
