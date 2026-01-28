@@ -1,4 +1,6 @@
 <#
+Module: Create-WinISO
+
 .SYNOPSIS
     Build a customized Windows Pro ISO with injected drivers.
 
@@ -8,46 +10,6 @@
 
 .AUTHOR
     Tyler Cox
-
-.CHANGELOG
-    v1.0.0 - Initial release
-        - Base ISO extraction and rebuild logic
-        - Driver injection support
-        - Bootable ISO creation (BIOS + UEFI)
-
-    v1.1.0
-        - Replaced all working paths with C:\Build
-        - Added user prompt for Windows ISO path
-        - Automatic cleanup and folder preparation
-    v1.2.0
-        - Automatic Windows image index detection
-        - Explicit selection of Windows Pro edition
-
-    v1.2.1
-        - Explicit oscdimg.exe path resolution (ADK)
-        - Clearer error messaging during ISO creation
-
-    v2.0.0
-        - Added menu system for Automatic, Download ISO, Select Drivers, and Build options
-        - Automatic mode skips ISO download if one already exists in StockISO
-        - Optimization: Skip ISO extraction if the ISO in StockISO has not changed since last build
-        - Added interactive driver selection with categories (Wifi, Ethernet, Chipset)
-        v2.1.5
-            - Expose ADK features as `-AdkFeatures` script parameter so callers can control which components are installed
-        - Copy driver folders by category
-        - Ask user if they have more drivers to add
-        - Check for mounted WIMs and unmount before mounting
-    v2.1.0
-        - Added function to ensure oscdimg.exe is available
-        - User prompt to install ADK if missing
-
-    v2.1.1
-        - Use PowerShell to download Windows ADK with browser fallback
-        - Improved non-interactive handling for ADK install prompt
-        - Added silent ADK install option using `/quiet /norestart /ceip off` via `-AutoInstallAdk` or interactive selection
-        - Make Silent the default ADK installer option and auto-select after 10 seconds of no input
-        - Show a progress bar during silent ADK installation
-        - Silent ADK install now limits components to Deployment Tools and Imaging and Configuration Designer
 
 .PARAMETERS
     -BuildRoot           : (string) Override build root directory. Default: C:\Build
@@ -66,7 +28,56 @@
         .\Create-WinISO.ps1 -NonInteractive -IsoPath 'C:\isos\win11.iso' -OscdimgPath 'C:\Tools\oscdimg.exe'
 
     Override build root and drivers folder:
-        pwsh -File .\Create-WinISO.ps1 -BuildRoot 'D:\Build' -Drivers 'D:\Drivers'
+        pwsh -File .\Create-WinISO.ps1 -BuildRoot 'C:\Build' -Drivers 'C:\Build\Drivers'
+
+
+.CHANGELOG
+    v1.0.0 - Initial release 2026-01-15
+        - Base ISO extraction and rebuild logic
+        - Driver injection support
+        - Bootable ISO creation (BIOS + UEFI)
+
+    v1.1.0 2026-01-16
+        - Replaced all working paths with C:\Build
+        - Added user prompt for Windows ISO path
+        - Automatic cleanup and folder preparation
+    v1.2.0 2026-01-19
+        - Automatic Windows image index detection
+        - Explicit selection of Windows Pro edition
+
+    v1.2.1 2026-01-19
+        - Explicit oscdimg.exe path resolution (ADK)
+        - Clearer error messaging during ISO creation
+
+    v2.0.0 2026-01-20
+        - Added menu system for Automatic, Download ISO, Select Drivers, and Build options
+        - Automatic mode skips ISO download if one already exists in StockISO
+        - Optimization: Skip ISO extraction if the ISO in StockISO has not changed since last build
+        - Added interactive driver selection with categories (Wifi, Ethernet, Chipset)
+    v2.1.0 2026-01-21
+        - Copy driver folders by category
+        - Ask user if they have more drivers to add
+        - Check for mounted WIMs and unmount before mounting
+    v2.1.1 2026-01-22
+        - Added function to ensure oscdimg.exe is available
+        - User prompt to install ADK if missing
+
+    v2.2 2026-01-22
+        - Use PowerShell to download Windows ADK with browser fallback
+        - Improved non-interactive handling for ADK install prompt
+        - Added silent ADK install option using `/quiet /norestart /ceip off` via `-AutoInstallAdk` or interactive selection
+        - Make Silent the default ADK installer option and auto-select after 10 seconds of no input
+        - Show a progress bar during silent ADK installation
+        - Silent ADK install now limits components to Deployment Tools and Imaging and Configuration Designer
+
+    v2.3.0 - 2026-01-23
+        - Reuse existing `adksetup.exe` if present instead of deleting it
+        - Retry silent ADK installs on exit code 1001 (rate limit) with exponential backoff and warn user
+        - Remove STDERR capture/logging from silent installer helper
+        - Download and run `DL-WinISO.ps1` locally (or use remote raw script) and handle rate-limit responses
+        - If DL-WinISO fails, prompt user to provide an ISO (support Media Creation Tool flow)
+        - Download Microsoft Media Creation Tool, wait 3s before download, and launch it elevated
+        - Various robustness and UX improvements around downloads and prompts
 #>
 
 Param(
@@ -77,11 +88,26 @@ Param(
     [switch]$NonInteractive,
     [switch]$DryRun,
     [switch]$AutoInstallAdk,
-    [string[]]$AdkFeatures = @('Deployment Tools','Imaging and Configuration Designer')
+    [string[]]$AdkFeatures = @('Deployment Tools','Imaging and Configuration Designer'),
+    [switch]$Help
 )
 
+if ($Help) {
+    Write-Host "Create-WinISO.ps1 - Parameters:" -ForegroundColor Cyan
+    Write-Host "  -BuildRoot        : string    Build root directory (default C:\Build)"
+    Write-Host "  -Drivers          : string    Drivers folder path"
+    Write-Host "  -IsoPath          : string    Path to an existing Windows ISO (non-interactive)"
+    Write-Host "  -OscdimgPath      : string    Explicit path to oscdimg.exe (ADK)"
+    Write-Host "  -NonInteractive   : switch    Run without interactive prompts"
+    Write-Host "  -DryRun           : switch    Show actions without performing changes"
+    Write-Host "  -AutoInstallAdk   : switch    Attempt unattended ADK install if missing"
+    Write-Host "Examples:" -ForegroundColor Cyan
+    Write-Host "  .\Create-WinISO.ps1 -Help"
+    return
+}
+
 # ---------------- Script Version Auto-Increment ----------------
-$ScriptVersion = [version]2.1.1
+$ScriptVersion = [version]2.2.0
 $NewVersion    = [version]::new($ScriptVersion.Major, $ScriptVersion.Minor, $ScriptVersion.Build + 1)
 Write-Host "Running script version $NewVersion"
 
@@ -576,15 +602,27 @@ function Get-WindowsISO {
 }
 
 function Show-Menu {
-    Write-Host "================= Windows ISO Build Menu ================="
-    Write-Host "1) Automatic (Full Build)"
-    Write-Host "2) Download ISO"
-    Write-Host "3) Select Drivers"
-    Write-Host "4) Build ISO"
-    Write-Host "5) Exit"
-    Write-Host "=========================================================="
+    Write-Host ""
+    Write-Host '  ############################################################'
+    Write-Host '  #                                                          #'
+    Write-Host '  #               WINDOWS ISO BUILDER - Create-WinISO        #'
+    Write-Host '  #         Extract • Inject Drivers • Rebuild (BIOS+UEFI)   #'
+    Write-Host '  #                                                          #'
+    Write-Host '  #        Tip: Run as Administrator for full capabilities   #'
+    Write-Host '  #                                                          #'
+    Write-Host '  ############################################################'
+    Write-Host ""
+    Write-Host "  1) Automatic (Full Build)     - Run the full build flow"
+    Write-Host "  2) Download ISO               - Use DL-WinISO / MCT fallback"
+    Write-Host "  3) Select Drivers             - Add or copy driver folders"
+    Write-Host "  4) Build ISO                  - Extract, inject, and rebuild"
+    Write-Host "  5) Exit                       - Quit the script"
+    Write-Host ""
 
-    do { $menuChoice = Read-Host "Select an option (1-5)" } while ($menuChoice -notin "1","2","3","4","5")
+    # Decorative footer
+    Write-Host '  ------------------------------------------------------------'
+
+    do { $menuChoice = Read-Host 'Select an option (1-5)' } while ($menuChoice -notin '1','2','3','4','5')
     return $menuChoice
 }
 
